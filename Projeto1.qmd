@@ -1,0 +1,858 @@
+---
+title: "**PRÁTICA ESTATÍSTICA II**"
+subtitle: "**ATIVIDADE AVALIATIVA 6: PROJETO I** <br> Consumo de doces na pandemia de COVID-19"
+author: "Luiza Braga Cândido (luizacandido@id.uff.br)"
+date: today
+date-format: "DD/MM/YYYY"
+institute: "Universidade Federal Fluminense"
+format:
+  revealjs:
+    embed-resources: true
+    css: custom.css
+    slide-number: true
+    incremental: false
+    transition: slide
+    background-transition: fade
+    width: 1280
+    height: 720
+    margin: 0.07
+    auto-stretch: false
+    fontsize: 32px
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(rstatix)
+library(car)
+
+# ---------------------------------------------------------------------------
+# Leitura dos dados
+# A base deve estar na mesma pasta deste .qmd (Nutricao.xlsx ou Nutrição.xlsx)
+# ---------------------------------------------------------------------------
+arquivo <- list.files(pattern = "^Nutri.*\\.xlsx$")[1]
+dados_brutos <- read_excel(arquivo)
+
+niveis_resp <- c("Aumentou", "Diminuiu", "Não alterou", "Não consumo")
+
+cores_resp <- c(
+  "Aumentou"    = "#2a78d6",
+  "Diminuiu"    = "#e34948",
+  "Não alterou" = "#b5b3ab",
+  "Não consumo" = "#52514e"
+)
+
+# ---------------------------------------------------------------------------
+# Tratamento: agrupamento/exclusão de categorias com poucas observações
+# ---------------------------------------------------------------------------
+dados <- dados_brutos |>
+  mutate(
+    Doces = factor(Doces, levels = niveis_resp),
+
+    Genero = if_else(Genero %in% c("Feminino", "Masculino"), Genero, NA_character_),
+    Genero = factor(Genero, levels = c("Feminino", "Masculino")),
+
+    Raca_cor = case_when(
+      Raca_cor %in% c("Amarela", "Indígena", "Outro") ~ "Outras",
+      Raca_cor == "Prefiro não declarar" ~ NA_character_,
+      TRUE ~ Raca_cor
+    ),
+    Raca_cor = factor(Raca_cor, levels = c("Branca", "Parda", "Preta", "Outras")),
+
+    Regiao = if_else(Regiao == "Centro-oeste", "Centro-Oeste", Regiao),
+    Regiao = factor(Regiao, levels = c("Norte", "Nordeste", "Centro-Oeste", "Sudeste", "Sul")),
+
+    Escolaridade = case_when(
+      Escolaridade %in% c("Analfabeto", "Ensino Fundamental Completo",
+                          "Ensino Médio Completo") ~ "Até Ensino Médio",
+      Escolaridade == "Não desejo informar" ~ NA_character_,
+      TRUE ~ Escolaridade
+    ),
+    Escolaridade = factor(Escolaridade,
+                          levels = c("Até Ensino Médio", "Ensino Superior Completo",
+                                     "Pós-graduação")),
+
+    Renda_familiar = case_when(
+      Renda_familiar == "até R$ 1254,00"            ~ "Até R$ 1.254",
+      Renda_familiar == "entre R$ 1.255 - R$ 8.640" ~ "R$ 1.255 a R$ 8.640",
+      Renda_familiar == "mais de R$ 8.640"          ~ "Mais de R$ 8.640"
+    ),
+    Renda_familiar = factor(Renda_familiar,
+                            levels = c("Até R$ 1.254", "R$ 1.255 a R$ 8.640",
+                                       "Mais de R$ 8.640")),
+
+    across(c(Trabalha, Dificuldade_Financeira, Isolamento, Covid,
+             Consulta_Nutricionista, cigarro, Ansiedade, Depressao,
+             Insonia, Enxaqueca),
+           ~ factor(.x, levels = c("Sim", "Não")))
+  )
+
+rotulos <- c(
+  Genero                 = "Gênero",
+  Raca_cor               = "Raça/cor",
+  Regiao                 = "Região",
+  Escolaridade           = "Escolaridade",
+  Renda_familiar         = "Renda familiar",
+  Trabalha               = "Trabalha",
+  Dificuldade_Financeira = "Dificuldade financeira",
+  Isolamento             = "Isolamento social",
+  Covid                  = "Teve COVID-19",
+  Consulta_Nutricionista = "Consultou nutricionista",
+  cigarro                = "Fuma",
+  Ansiedade              = "Ansiedade",
+  Depressao              = "Depressão",
+  Insonia                = "Insônia",
+  Enxaqueca              = "Enxaqueca",
+  Idade                  = "Idade (anos)",
+  Peso                   = "Peso (kg)",
+  Altura                 = "Altura (m)",
+  IMC                    = "IMC (kg/m²)"
+)
+
+vars_quali <- c("Genero", "Raca_cor", "Regiao", "Escolaridade",
+                "Renda_familiar", "Trabalha", "Dificuldade_Financeira",
+                "Isolamento", "Covid", "Consulta_Nutricionista", "cigarro",
+                "Ansiedade", "Depressao", "Insonia", "Enxaqueca")
+
+vars_quanti <- c(Idade = 1, Peso = 1, Altura = 2, IMC = 1)   # casas decimais
+
+# ---------------------------------------------------------------------------
+# Funções auxiliares de formatação (padrão brasileiro)
+# ---------------------------------------------------------------------------
+fmt_num <- function(x, d = 1) {
+  formatC(x, format = "f", digits = d, big.mark = ".", decimal.mark = ",")
+}
+
+fmt_p <- function(p) {
+  ifelse(p < 0.001, "&lt;0,001", fmt_num(p, 3))
+}
+
+html_bloco <- function(html) {
+  cat("```{=html}\n", html, "\n```\n", sep = "")
+}
+
+# ---------------------------------------------------------------------------
+# Teste de associação: qui-quadrado (ou Fisher se as esperadas forem baixas),
+# V de Cramér e resíduos padronizados ajustados
+# ---------------------------------------------------------------------------
+testa_assoc <- function(var) {
+  tb <- table(dados[[var]], dados$Doces)
+  tb <- tb[rowSums(tb) > 0, , drop = FALSE]
+
+  qui <- suppressWarnings(chisq.test(tb, correct = FALSE))
+  esperadas_baixas <- mean(qui$expected < 5) > 0.20 || any(qui$expected < 1)
+
+  if (esperadas_baixas) {
+    set.seed(2026)
+    p     <- fisher.test(tb, simulate.p.value = TRUE, B = 10000)$p.value
+    teste <- "Fisher"
+  } else {
+    p     <- qui$p.value
+    teste <- "Qui-quadrado"
+  }
+
+  V <- sqrt(unname(qui$statistic) / (sum(tb) * (min(dim(tb)) - 1)))
+
+  list(tb = tb, p = p, teste = teste, V = V, res = qui$stdres,
+       chi = unname(qui$statistic), gl = unname(qui$parameter),
+       pct_esp_baixa = mean(qui$expected < 5))
+}
+
+resultados_assoc <- lapply(vars_quali, testa_assoc)
+names(resultados_assoc) <- vars_quali
+
+celula <- function(n, pct, r, destacar = TRUE) {
+  txt <- paste0(fmt_num(n, 0), " (", fmt_num(pct, 1), "%)")
+  if (!destacar) {
+    paste0("<td>", txt, "</td>")
+  } else if (r > 1.96) {
+    paste0("<td class='res-pos'>", txt, " &#9650;</td>")
+  } else if (r < -1.96) {
+    paste0("<td class='res-neg'>", txt, " &#9660;</td>")
+  } else {
+    paste0("<td>", txt, "</td>")
+  }
+}
+
+tabela_quali <- function(vars, titulo) {
+  n_resp <- table(dados$Doces)
+
+  cabecalho <- paste0(
+    "<thead><tr><th>Variável</th>",
+    paste0("<th>", names(n_resp), "<br><span class='n-cab'>N = ",
+           fmt_num(as.numeric(n_resp), 0), "</span></th>", collapse = ""),
+    "<th>Total</th><th><i>p</i>-valor</th><th>V de Cramér</th></tr></thead>"
+  )
+
+  linhas <- character(0)
+  usou_fisher <- FALSE
+
+  for (v in vars) {
+    r <- resultados_assoc[[v]]
+    if (r$teste == "Fisher") usou_fisher <- TRUE
+    marca <- if (r$teste == "Fisher") "<sup>&dagger;</sup>" else ""
+    p_txt <- fmt_p(r$p)
+    if (r$p < 0.05) p_txt <- paste0("<strong>", p_txt, "</strong>")
+
+    linhas <- c(linhas, paste0(
+      "<tr><td><strong>", rotulos[v], "</strong></td>",
+      strrep("<td></td>", 5),
+      "<td>", p_txt, marca, "</td>",
+      "<td>", fmt_num(r$V, 3), "</td></tr>"
+    ))
+
+    pct <- prop.table(r$tb, 1) * 100
+    cats <- rownames(r$tb)
+    for (i in seq_along(cats)) {
+      classe <- if (i == length(cats)) " class='linha-categoria'" else ""
+      celulas <- vapply(seq_len(ncol(r$tb)), function(j) {
+        # resíduos só são interpretados quando o teste global é significativo
+        celula(r$tb[i, j], pct[i, j], r$res[i, j], destacar = r$p < 0.05)
+      }, character(1))
+      linhas <- c(linhas, paste0(
+        "<tr", classe, "><td class='recuo'>", cats[i], "</td>",
+        paste0(celulas, collapse = ""),
+        "<td>", fmt_num(sum(r$tb[i, ]), 0), "</td><td></td><td></td></tr>"
+      ))
+    }
+  }
+
+  rodape <- paste0(
+    "Frequência absoluta e percentual por linha. <i>p</i>-valor do teste qui-quadrado de ",
+    "independência; em negrito quando <i>p</i> &lt; 0,05",
+    if (usou_fisher) "; &dagger; teste exato de Fisher (Monte Carlo)" else "",
+    ". Nas variáveis com associação significativa, as caselas destacadas têm resíduo padronizado ajustado com |r| &gt; 1,96: ",
+    "&#9650; mais casos que o esperado sob independência; &#9660; menos casos."
+  )
+
+  html_bloco(paste0(
+    "<div class='titulo-tabela'>", titulo, "</div>",
+    "<div class='caixa-scroll'><table class='tabela-artigo'>",
+    cabecalho, "<tbody>", paste0(linhas, collapse = ""), "</tbody></table>",
+    "<div class='rodape-tabela'>", rodape, "</div></div>"
+  ))
+}
+
+# ---------------------------------------------------------------------------
+# Variáveis quantitativas: ANOVA de Welch, Levene, Kruskal-Wallis e
+# comparações múltiplas de Games-Howell
+# ---------------------------------------------------------------------------
+analisa_quanti <- function(v) {
+  f <- reformulate("Doces", response = v)
+  list(
+    resumo = dados |>
+      group_by(Doces) |>
+      summarise(media = mean(.data[[v]]), dp = sd(.data[[v]]),
+                mediana = median(.data[[v]]),
+                q1 = quantile(.data[[v]], 0.25), q3 = quantile(.data[[v]], 0.75),
+                .groups = "drop"),
+    welch   = oneway.test(f, data = dados, var.equal = FALSE),
+    levene  = leveneTest(f, data = dados),
+    kruskal = kruskal.test(f, data = dados),
+    gh      = games_howell_test(dados, f)
+  )
+}
+
+resultados_quanti <- lapply(names(vars_quanti), analisa_quanti)
+names(resultados_quanti) <- names(vars_quanti)
+
+tema_graf <- theme_minimal(base_size = 17) +
+  theme(
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.major.x = element_line(color = "#e1e0d9", linewidth = 0.4),
+    axis.text          = element_text(color = "#52514e"),
+    axis.title         = element_text(color = "#52514e"),
+    plot.title         = element_text(color = "#0b0b0b", face = "bold"),
+    legend.position    = "top",
+    legend.title       = element_blank(),
+    legend.text        = element_text(color = "#0b0b0b")
+  )
+```
+
+# INTRODUÇÃO
+
+## Contexto
+
+::::: {.box-grey .compacto}
+:::: panel-tabset
+### A pandemia
+
+- A COVID-19 alterou a dinâmica da população: **isolamento social**, trabalho remoto e fechamento de comércios e serviços;
+
+- Impactos emocionais: segundo a Fiocruz (2020), durante a pandemia, 52,6% dos adultos no Brasil relataram sentir-se frequentemente ansiosos ou nervosos.
+
+
+### Doces
+
+- Alimentos ricos em açúcar costumam ser buscados como **conforto** em períodos de estresse, o chamado **comer emocional**;
+- O levantamento do Grupo Pão de Açúcar (GPA), noticiado na Veja, documentou o aumento nas vendas de chocolates e guloseimas logo nos primeiros meses de confinamento em 2020.
+::::
+:::::
+
+## Problema e objetivos
+
+::::: {.box-grey .compacto}
+:::: panel-tabset
+### Problema de pesquisa
+
+::: destaque
+**Quais fatores estão associados às mudanças no consumo de doces durante a pandemia de COVID-19?**
+:::
+
+- Variável resposta: **`Doces`**, mudança no consumo de doces;
+- Categorias: **Aumentou**, **Diminuiu**, **Não alterou** e **Não consumo**.
+
+### Objetivos
+
+**Objetivo geral**
+
+- Avaliar a associação entre a mudança no consumo de doces e as variáveis explicativas do banco de dados.
+
+**Objetivos específicos**
+
+- Investigar a relação com características **sociodemográficas e econômicas**;
+- Avaliar fatores ligados à **pandemia e à saúde**;
+- Avaliar a relação com a **saúde emocional**;
+- Comparar **idade, peso, altura e IMC** entre as categorias de mudança.
+::::
+:::::
+
+# METODOLOGIA
+
+## Os dados
+
+::::: {.box-grey .compacto}
+:::: panel-tabset
+### Origem
+
+- **Questionário online** aplicado em **2022**, durante a pandemia de COVID-19;
+- Dados coletados por alunas da **pós-graduação em Nutrição da UFF**;
+- **n = 2.155** adultos;
+- Nenhum dado faltante nas variáveis analisadas.
+
+### Variável resposta
+
+```{r}
+#| fig-width: 11
+#| fig-height: 3.6
+#| fig-dpi: 150
+
+dist_resp <- dados |>
+  count(Doces) |>
+  mutate(pct = n / sum(n) * 100,
+         rotulo = paste0(fmt_num(pct, 1), "%  (n = ", fmt_num(n, 0), ")"),
+         Doces = factor(Doces, levels = rev(niveis_resp)))
+
+ggplot(dist_resp, aes(x = pct, y = Doces)) +
+  geom_col(width = 0.62, fill = "#2a78d6") +
+  geom_text(aes(label = rotulo), hjust = -0.06, size = 5.6, color = "#0b0b0b") +
+  scale_x_continuous(limits = c(0, 66), expand = c(0, 0),
+                     labels = function(x) paste0(x, "%")) +
+  labs(x = NULL, y = NULL,
+       title = "Mudança no consumo de doces durante a pandemia") +
+  tema_graf
+```
+
+### Variáveis explicativas {style="font-size: 30%;"}
+
+:::: {.columns}
+::: {.column width="55%"}
+**Categóricas (15)**
+
+- **Sociodemográficas:** gênero, raça/cor, região, escolaridade;
+- **Socioeconômicas:** renda familiar, trabalho, dificuldade financeira;
+- **Pandemia e saúde:** isolamento, COVID-19, nutricionista, fumo;
+- **Saúde emocional:** ansiedade, depressão, insônia, enxaqueca.
+:::
+
+::: {.column width="45%"}
+**Quantitativas (4)**
+
+- Idade (anos);
+- Peso (kg);
+- Altura (m);
+- IMC (kg/m²).
+:::
+::::
+::::
+:::::
+
+## Tratamento dos dados
+
+::: {.box-grey .compacto}
+Categorias com **pouquíssimas observações** foram agrupadas ou excluídas, para garantir frequências esperadas adequadas no qui-quadrado:
+
+::: {style="font-size: 72%;"}
+| Variável | Ajuste | Excluídos |
+|:--|:--|:--:|
+| Gênero | "Outro" (6) e "Prefiro não responder" (5) excluídos | 11 |
+| Raça/cor | Amarela, Indígena e Outro agrupadas em **"Outras"** (39); "Prefiro não declarar" excluído | 28 |
+| Escolaridade | Analfabeto, Fundamental e Médio agrupados em **"Até Ensino Médio"**; "Não desejo informar" excluído | 17 |
+
+: {tbl-colwidths="[18,70,12]"}
+:::
+
+::: nota
+As exclusões valem apenas para o teste da própria variável. Nas demais análises, todos os 2.155 participantes foram mantidos.
+:::
+:::
+
+## Métodos estatísticos
+
+::::: {.box-grey .compacto}
+:::: panel-tabset
+### Qui-quadrado
+
+- Testa a **independência** entre a variável resposta e cada variável categórica;
+- H₀: as variáveis são independentes; H₁: existe associação;
+- **Suposições:** observações independentes e frequência esperada ≥ 5 em pelo menos 80% das caselas, sem nenhuma abaixo de 1;
+- Se a suposição falhasse, seria usado o **teste exato de Fisher** (Monte Carlo). Após o tratamento dos dados, **todas as tabelas atenderam à suposição**.
+
+### V de Cramér
+
+- Mede a **intensidade** da associação, de 0 a 1;
+- Necessário porque, com **n = 2.155**, até associações muito fracas ficam significativas;
+- Referência usual de interpretação:
+
+::: {style="font-size: 80%;"}
+| V de Cramér | Até 0,10 | 0,10 a 0,30 | 0,30 a 0,50 | Acima de 0,50 |
+|:--|:--:|:--:|:--:|:--:|
+| Intensidade | Desprezível | Fraca | Moderada | Forte |
+:::
+
+### Resíduos padronizados
+
+- O qui-quadrado diz **se** há associação; os resíduos mostram **onde** ela está;
+- Resíduo padronizado ajustado com **|r| > 1,96** indica casela influente ao nível de 5%;
+- Nas tabelas: **&#9650;** mais casos que o esperado e **&#9660;** menos casos que o esperado sob independência.
+
+### ANOVA de Welch
+
+- Compara as **médias** de idade, peso, altura e IMC entre as 4 categorias da resposta;
+- **Suposições:** independência e normalidade (com grupos grandes, garantida aproximadamente pelo TCL). **Não exige variâncias iguais**;
+- Escolhida porque os grupos são **muito desbalanceados** (de 97 a 966 pessoas) e o **teste de Levene** indicou variâncias diferentes para idade e altura;
+- Comparações múltiplas pelo teste de **Games-Howell**;
+- **Kruskal-Wallis** usado como análise de sensibilidade.
+
+### Software
+
+- Nível de significância: **α = 5%**;
+- Análises feitas no **R**, com os pacotes:
+  - `readxl`: leitura da base;
+  - `dplyr` e `tidyr`: manipulação dos dados;
+  - `rstatix` e `car`: Games-Howell e teste de Levene;
+  - `ggplot2`: gráficos.
+::::
+:::::
+
+# RESULTADOS
+
+## Variáveis qualitativas {style="font-size: 60%;"}
+
+::::: box-grey
+:::: panel-tabset
+### Sociodemográficas
+
+::: {style="max-height: 580px; overflow-y: auto; padding-right: 8px;"}
+```{r}
+#| output: asis
+tabela_quali(c("Genero", "Raca_cor", "Regiao", "Escolaridade"),
+             "Tabela 1 - Mudança no consumo de doces segundo variáveis sociodemográficas.")
+```
+:::
+### Socioeconômicas
+
+```{r}
+#| output: asis
+tabela_quali(c("Renda_familiar", "Trabalha", "Dificuldade_Financeira"),
+             "Tabela 2 - Mudança no consumo de doces segundo variáveis socioeconômicas.")
+```
+
+### Pandemia e saúde
+
+```{r}
+#| output: asis
+tabela_quali(c("Isolamento", "Covid", "Consulta_Nutricionista", "cigarro"),
+             "Tabela 3 - Mudança no consumo de doces segundo fatores da pandemia e saúde.")
+```
+
+### Saúde emocional
+
+```{r}
+#| output: asis
+tabela_quali(c("Ansiedade", "Depressao", "Insonia", "Enxaqueca"),
+             "Tabela 4 - Mudança no consumo de doces segundo saúde emocional.")
+```
+::::
+:::::
+
+## Intensidade das associações
+
+::: box-grey
+```{r}
+#| fig-width: 11.5
+#| fig-height: 4.9
+#| fig-dpi: 150
+
+intensidade <- tibble(
+  var = vars_quali,
+  rotulo = unname(rotulos[vars_quali]),
+  V = sapply(resultados_assoc, `[[`, "V"),
+  p = sapply(resultados_assoc, `[[`, "p")
+) |>
+  mutate(signif = if_else(p < 0.05, "Associação significativa (p < 0,05)",
+                          "Sem associação (p ≥ 0,05)"),
+         rotulo = reorder(rotulo, V))
+
+ggplot(intensidade, aes(x = V, y = rotulo, fill = signif)) +
+  scale_y_discrete() +
+  annotate("rect", xmin = 0.10, xmax = 0.30, ymin = -Inf, ymax = Inf,
+           fill = "#f0efec") +
+  geom_vline(xintercept = c(0.10, 0.30), color = "#898781",
+             linetype = "dashed", linewidth = 0.5) +
+  annotate("text", x = c(0.05, 0.20, 0.335), y = 15.75,
+           label = c("desprezível", "fraca", "moderada"),
+           color = "#52514e", size = 4.6, vjust = 0) +
+  geom_col(width = 0.66) +
+  geom_text(aes(label = fmt_num(V, 2)), hjust = -0.18, size = 4.4,
+            color = "#0b0b0b") +
+  scale_fill_manual(values = c("Associação significativa (p < 0,05)" = "#2a78d6",
+                               "Sem associação (p ≥ 0,05)" = "#c3c2b7")) +
+  scale_x_continuous(limits = c(0, 0.37), expand = c(0, 0),
+                     breaks = c(0, 0.1, 0.2, 0.3),
+                     labels = function(x) fmt_num(x, 1)) +
+  coord_cartesian(clip = "off") +
+  labs(x = "V de Cramér", y = NULL) +
+  tema_graf +
+  theme(plot.margin = margin(t = 22, r = 10, b = 5, l = 5))
+```
+
+::: nota 
+**Nenhuma associação chegou a ser moderada.** As mais "relevantes" (todas **fracas**), foram dificuldade financeira, gênero e ansiedade.
+:::
+:::
+
+## Destaque: duas forças opostas
+
+::::: box-grey
+:::: panel-tabset
+### Saúde emocional
+
+```{r}
+#| fig-width: 11.5
+#| fig-height: 3.9
+#| fig-dpi: 150
+
+pct_por_grupo <- function(vars, categoria_resp) {
+  lapply(vars, function(v) {
+    dados |>
+      filter(!is.na(.data[[v]])) |>
+      group_by(categoria = as.character(.data[[v]])) |>
+      summarise(pct = mean(Doces == categoria_resp) * 100, .groups = "drop") |>
+      mutate(variavel = unname(rotulos[v]),
+             categoria = factor(categoria, levels = levels(dados[[v]])))
+  }) |>
+    bind_rows() |>
+    mutate(variavel = factor(variavel, levels = unname(rotulos[vars])))
+}
+
+grafico_grupos <- function(df, cor, ref, eixo_y, lim_y) {
+  ggplot(df, aes(x = categoria, y = pct)) +
+    geom_hline(yintercept = ref, color = "#898781", linetype = "dashed") +
+    geom_col(width = 0.62, fill = cor) +
+    geom_text(aes(label = paste0(fmt_num(pct, 1), "%")), vjust = -0.45,
+              size = 4.6, color = "#0b0b0b") +
+    facet_grid(~ variavel, scales = "free_x", space = "free_x") +
+    scale_y_continuous(limits = c(0, lim_y), expand = c(0, 0),
+                       labels = function(x) paste0(x, "%")) +
+    scale_x_discrete(labels = function(x) gsub(" ", "\n", gsub("R\\$ ", "R$ ", x))) +
+    labs(x = NULL, y = eixo_y) +
+    tema_graf +
+    theme(panel.grid.major.x = element_blank(),
+          panel.grid.major.y = element_line(color = "#e1e0d9", linewidth = 0.4),
+          strip.text = element_text(face = "bold", color = "#0b0b0b", size = 14),
+          axis.text.x = element_text(size = 11.5, lineheight = 0.9))
+}
+
+emocionais <- pct_por_grupo(c("Ansiedade", "Depressao", "Insonia", "Enxaqueca"), "Aumentou")
+grafico_grupos(emocionais, cores_resp[["Aumentou"]],
+               mean(dados$Doces == "Aumentou") * 100, "Aumentou o consumo", 66)
+```
+
+::: nota
+Linha tracejada: percentual geral que aumentou o consumo (44,8%). Quem relatou **ansiedade, depressão, insônia ou enxaqueca** aumentou mais o consumo de doces.
+:::
+
+### Fatores socioeconômicos
+
+```{r}
+#| fig-width: 11.5
+#| fig-height: 3.9
+#| fig-dpi: 150
+
+socioecon <- pct_por_grupo(c("Dificuldade_Financeira", "Renda_familiar",
+                             "Escolaridade", "Trabalha"), "Diminuiu")
+grafico_grupos(socioecon, cores_resp[["Diminuiu"]],
+               mean(dados$Doces == "Diminuiu") * 100, "Diminuiu o consumo", 42)
+```
+
+::: nota
+Linha tracejada: percentual geral que diminuiu o consumo (20,6%). Nos grupos **mais vulneráveis financeiramente**, a redução foi maior.
+:::
+
+### Gênero
+
+```{r}
+#| fig-width: 11.5
+#| fig-height: 3.6
+#| fig-dpi: 150
+
+ordem_div <- c("Diminuiu", "Não alterou", "Aumentou", "Não consumo")
+
+genero <- dados |>
+  filter(!is.na(Genero)) |>
+  count(Genero, Doces) |>
+  group_by(Genero) |>
+  mutate(pct = n / sum(n) * 100, n_tot = sum(n)) |>
+  ungroup() |>
+  mutate(Doces = factor(Doces, levels = rev(ordem_div)),
+         Genero = paste0(Genero, " (n = ", fmt_num(n_tot, 0), ")"),
+         Genero = factor(Genero, levels = rev(unique(Genero))),
+         rotulo = if_else(pct >= 6, paste0(fmt_num(pct, 1), "%"), ""),
+         cor_txt = if_else(Doces == "Não alterou", "#0b0b0b", "#ffffff"))
+
+ggplot(genero, aes(x = pct, y = Genero, fill = Doces)) +
+  geom_col(width = 0.6, color = "white", linewidth = 0.9) +
+  geom_text(aes(label = rotulo, color = cor_txt, group = Doces),
+            position = position_stack(vjust = 0.5), size = 5.6, fontface = "bold") +
+  scale_fill_manual(values = cores_resp, breaks = ordem_div) +
+  scale_color_identity() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(x = NULL, y = NULL) +
+  tema_graf +
+  theme(panel.grid.major.x = element_blank(), axis.text.x = element_blank())
+```
+
+::: nota
+Entre as mulheres, **49,6% aumentaram** o consumo de doces, contra **30,6%** dos homens.
+:::
+::::
+:::::
+
+## Variáveis quantitativas
+
+::::: box-grey
+:::: panel-tabset
+### Medidas resumo
+
+```{r}
+#| output: asis
+
+n_resp <- table(dados$Doces)
+
+cab_q <- paste0(
+  "<thead><tr><th>Variável</th>",
+  paste0("<th>", names(n_resp), "<br><span class='n-cab'>N = ",
+         fmt_num(as.numeric(n_resp), 0), "</span></th>", collapse = ""),
+  "<th><i>p</i>-valor<br><span class='n-cab'>Welch</span></th>",
+  "<th><i>p</i>-valor<br><span class='n-cab'>Levene</span></th>",
+  "<th><i>p</i>-valor<br><span class='n-cab'>Kruskal-Wallis</span></th></tr></thead>"
+)
+
+linhas_q <- vapply(names(vars_quanti), function(v) {
+  r <- resultados_quanti[[v]]
+  d <- vars_quanti[[v]]
+  cel <- paste0(
+    "<td>", fmt_num(r$resumo$media, d), " (", fmt_num(r$resumo$dp, d), ")",
+    "<br><span class='md'>", fmt_num(r$resumo$mediana, d), " [",
+    fmt_num(r$resumo$q1, d), "; ", fmt_num(r$resumo$q3, d), "]</span></td>",
+    collapse = ""
+  )
+  negrito <- function(p) if (p < 0.05) paste0("<strong>", fmt_p(p), "</strong>") else fmt_p(p)
+  paste0("<tr class='linha-categoria'><td><strong>", rotulos[v], "</strong></td>", cel,
+         "<td>", negrito(r$welch$p.value), "</td>",
+         "<td>", fmt_p(r$levene$`Pr(>F)`[1]), "</td>",
+         "<td>", negrito(r$kruskal$p.value), "</td></tr>")
+}, character(1))
+
+html_bloco(paste0(
+  "<div class='titulo-tabela'>Tabela 5 - Variáveis quantitativas segundo a mudança no consumo de doces.</div>",
+  "<div class='caixa-scroll'><table class='tabela-artigo' style='font-size:62%;width:90%;'>",
+  cab_q, "<tbody>", paste0(linhas_q, collapse = ""), "</tbody></table>",
+  "<div class='rodape-tabela'>Média (desvio-padrão); abaixo, mediana [1º quartil; 3º quartil]. ",
+  "<i>p</i>-valor da ANOVA de Welch (teste principal), do teste de Levene para homogeneidade ",
+  "de variâncias e do teste de Kruskal-Wallis (análise de sensibilidade). Em negrito quando ",
+  "<i>p</i> &lt; 0,05.</div></div>"
+))
+```
+
+### Comparações múltiplas
+
+```{r}
+#| output: asis
+
+gh_sig <- lapply(names(vars_quanti), function(v) {
+  resultados_quanti[[v]]$gh |>
+    filter(p.adj < 0.05) |>
+    mutate(variavel = unname(rotulos[v]), d = vars_quanti[[v]])
+}) |>
+  bind_rows()
+
+linhas_gh <- if (nrow(gh_sig) == 0) {
+  "<tr><td colspan='4'>Nenhuma comparação significativa.</td></tr>"
+} else {
+  vapply(seq_len(nrow(gh_sig)), function(i) {
+    g <- gh_sig[i, ]
+    # rstatix devolve média(group2) - média(group1); invertemos para group1 - group2
+    dif <- -g$estimate; li <- -g$conf.high; ls <- -g$conf.low
+    paste0("<tr class='linha-categoria'><td><strong>", g$variavel, "</strong></td>",
+           "<td>", g$group1, " vs ", g$group2, "</td>",
+           "<td>", fmt_num(dif, g$d + 1), "</td>",
+           "<td>[", fmt_num(li, g$d + 1), "; ", fmt_num(ls, g$d + 1), "]</td>",
+           "<td><strong>", fmt_p(g$p.adj), "</strong></td></tr>")
+  }, character(1))
+}
+
+html_bloco(paste0(
+  "<div class='titulo-tabela'>Tabela 6 - Pares com diferença significativa no teste de Games-Howell.</div>",
+  "<div class='caixa-scroll'><table class='tabela-artigo' style='font-size:60%;'>",
+  "<thead><tr><th>Variável</th><th>Comparação</th><th>Diferença de médias</th>",
+  "<th>IC 95%</th><th><i>p</i> ajustado</th></tr></thead><tbody>",
+  paste0(linhas_gh, collapse = ""), "</tbody></table>",
+  "<div class='rodape-tabela'>Diferença = média do primeiro grupo menos média do segundo. ",
+  "Apenas os pares com <i>p</i> ajustado &lt; 0,05 são exibidos; os demais não diferiram. ",
+  paste(unname(rotulos[names(vars_quanti)[sapply(resultados_quanti, function(r) r$welch$p.value >= 0.05)]]), collapse = " e "),
+  " não apresentaram diferença na ANOVA de Welch.</div></div>"
+))
+```
+::::
+:::::
+
+## Interpretação dos resultados
+
+::::: {.box-grey .compacto}
+:::: panel-tabset
+### Emocionais
+
+- **Ansiedade** (V = 0,16): **52,8%** de quem relatou ansiedade aumentou o consumo de doces, contra **37,3%**;
+- **Depressão** (V = 0,13): **56,7%** aumentaram, contra **42,5%**;
+- **Insônia e enxaqueca** seguem o mesmo padrão, com associação mais fraca (V ≈ 0,10);
+
+### Socioeconômicas
+
+- **Dificuldade financeira** (V = 0,18): **34,5%** diminuíram o consumo, contra **17,5%** de quem não teve dificuldade;
+- **Trabalho** (V = 0,13): quem não trabalhava diminuiu mais (**27,6%** contra **18,1%**);
+- **Renda e escolaridade:** redução maior na renda até R\$ 1.254 (**30,2%**) e até o Ensino Médio (**24,3%**), com associação desprezível (V < 0,10).
+
+### Sociodemográficas
+
+- **Gênero** (V = 0,17): **49,6%** das mulheres aumentaram o consumo, contra **30,6%** dos homens;
+- **Região:** associação desprezível (V = 0,07). Sudeste aumentou mais; Norte e Centro-Oeste, menos;
+- **Raça/cor:** **sem** associação (*p* = 0,061).
+
+### Pandemia
+
+- **Isolamento social:** associação desprezível, com mais aumento entre os isolados (**47,0%** contra **42,0%**);
+- **Consulta com nutricionista:** quem consultou mudou mais o hábito. Menos gente **manteve** o consumo (22,8% contra 31,7%);
+- **Fumantes:** mais pessoas que **não consomem** doces (9,5% contra 4,2%);
+- **Ter tido COVID-19:** **sem** associação.
+
+### Quantitativas
+
+- **Idade:** quem **aumentou** o consumo é **mais jovem** (média de 31,8 anos), de 4,7 a 8,7 anos a menos que os demais grupos;
+- **Altura:** quem aumentou é um pouco mais baixo, mas isso é **efeito do gênero** (ver Discussão);
+- **Peso e IMC:** **sem** diferença entre os grupos;
+- Kruskal-Wallis confirmou as mesmas conclusões.
+::::
+:::::
+
+# CONCLUSÃO
+
+## Principais achados
+
+::: box-grey
+::: {style="font-size: 88%;"}
+**Objetivo:** avaliar quais fatores se associam à mudança no consumo de doces durante a pandemia.
+
+- Quase metade da amostra **aumentou** o consumo de doces (44,8%); 30,0% não alteraram e 20,6% diminuíram;
+- **13 das 15** variáveis categóricas e **2 das 4** quantitativas apresentaram associação ao nível de 5%, mas **todas fracas**;
+- Atuaram **duas forças opostas**: a **saúde emocional** puxou o consumo para cima e o **aperto financeiro** puxou para baixo;
+- Quem mais aumentou: **mulheres**, **mais jovens** e quem relatou **ansiedade ou depressão**.
+:::
+:::
+
+## Discussão
+
+::::: {.box-grey .compacto}
+:::: panel-tabset
+### Comer emocional
+
+- A associação com ansiedade e depressão é coerente com o uso de doces como **conforto** em momentos de estresse;
+- Esse efeito da ansiedade **ocorre em ambos os gêneros**
+
+### Renda
+
+- Com o orçamento apertado, doces são mais **cortados**;
+- As duas forças podem agir **na mesma pessoa**: alguém ansioso e com dificuldade financeira;
+- Uma análise **bivariada** não consegue separar esses efeitos.
+
+### O caso da altura
+
+::: destaque
+Quem aumentou o consumo é mais baixo. Mas **dentro de cada gênero, a diferença some** (*p* = 0,17 nas mulheres e *p* = 0,90 nos homens).
+:::
+
+- A altura só **parecia** associada porque as mulheres são mais baixas **e** aumentaram mais o consumo;
+- É um exemplo concreto de **variável de confusão**.
+
+### Significância × relevância
+
+- Com **n = 2.155**, até diferenças pequenas viram "significativas";
+- Todos os V de Cramér ficaram **abaixo de 0,20**: as associações existem, mas são **fracas**;
+- O **V de Cramér** e os **resíduos** foram essenciais para separar o que é **relevante** do que é só estatisticamente detectável.
+::::
+:::::
+
+## Limitações
+
+::: {.box-grey .compacto}
+- **Estudo transversal:** mostra associação, mas **não causalidade**. Não dá para saber se a ansiedade levou ao consumo de doces ou se as duas coisas têm outra causa em comum;
+- **Amostra por conveniência** (questionário online): tende a super-representar pessoas com **alta escolaridade** e acesso à internet (45% com pós-graduação);
+- **Dados autorrelatados**, sujeitos a viés de memória;
+- **Análises bivariadas**, sem controle de fatores de confusão, como mostrou o caso da altura. Uma regressão multinomial seria o próximo passo.
+:::
+
+## Referências
+
+::: box-grey
+::: {style="font-size: 58%;"}
+1.  MALTA, D. C. *et al.* A pandemia da COVID-19 e as mudanças no estilo de vida dos brasileiros adultos: um estudo transversal, 2020. **Epidemiologia e Serviços de Saúde**, v. 29, n. 4, e2020407, 2020.
+
+2.   BONIN, Robson. Pesquisa mostra como brasileiro se entregou aos doces na pandemia. Veja, Radar, 6 nov. 2020.
+
+3.  FUNDAÇÃO OSWALDO CRUZ (FIOCRUZ). ConVid Rede Pesquisa de Comportamentos: sentimentos, comportamentos e estilo de vida durante a pandemia de COVID-19. Rio de Janeiro: ICICT/Fiocruz, 2020. 
+
+4.  AGRESTI, A. **Categorical data analysis**. 3. ed. Hoboken: Wiley, 2013.
+
+5.  COHEN, J. **Statistical power analysis for the behavioral sciences**. 2. ed. Hillsdale: Lawrence Erlbaum, 1988.
+
+6.  WELCH, B. L. On the comparison of several mean values: an alternative approach. **Biometrika**, v. 38, n. 3/4, p. 330-336, 1951.
+
+7.  GAMES, P. A.; HOWELL, J. F. Pairwise multiple comparison procedures with unequal *n*'s and/or variances: a Monte Carlo study. **Journal of Educational Statistics**, v. 1, n. 2, p. 113-125, 1976.
+
+8.  R CORE TEAM. **R: a language and environment for statistical computing**. Viena: R Foundation for Statistical Computing, 2025.
+:::
+:::
+
+
+
